@@ -26,6 +26,7 @@ const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false, autoRefreshToken: false } })
   : null;
 const authReady = () => !!supabase && !!SESSION_SECRET && SESSION_SECRET.length >= 32;
+const FREE_ACCESS = (process.env.FREE_ACCESS_EMAILS || "").split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
 const paypalReady = () => !!(PAYPAL_CLIENT_ID && PAYPAL_CLIENT_SECRET && PAYPAL_PLAN_ID);
 
 if (!supabase) console.warn("WARNING: Supabase variables are missing.");
@@ -268,7 +269,7 @@ async function getStreak(email) {
   return last.quiz_date === today || last.quiz_date === shiftDay(today, -1) ? last.streak || 0 : 0;
 }
 
-const isPremium = (user) => user.plan === "premium";
+const isPremium = (user) => user.plan === "premium" || FREE_ACCESS.includes(String(user.email).toLowerCase());
 
 async function publicUser(user) {
   return {
@@ -350,12 +351,22 @@ async function syncSubscription(user) {
 // Re-checks PayPal at most every 6 hours, so cancellations are picked up without webhooks.
 async function maybeSync(user) {
   try {
-    const stale = !user.paypal_checked_at || Date.now() - Date.parse(user.paypal_checked_at) > 6 * 3600 * 1000;
+    const age = user.paypal_checked_at ? Date.now() - Date.parse(user.paypal_checked_at) : Infinity;
+    const stale = age > (user.plan === "premium" ? 3600 * 1000 : 15 * 1000);
     return paypalReady() && user.paypal_subscription_id && stale ? await syncSubscription(user) : user;
   } catch (err) {
     console.error(err);
     return user;
   }
+}
+
+// Everything except sign in, profile and billing needs an active subscription (the trial counts).
+async function requirePaid(req, res, next) {
+  try {
+    req.user = await maybeSync(req.user);
+    if (isPremium(req.user)) return next();
+    res.status(402).json({ error: "Subscribe to continue.", code: "subscription_required", lapsed: !!req.user.paypal_subscription_id });
+  } catch (err) { next(err); }
 }
 
 app.get("/api/billing/config", (req, res) => res.json({
@@ -477,7 +488,7 @@ app.post("/api/signup", wrap(async (req, res) => {
     console.error(error);
     return res.status(500).json({ error: "Could not create your account." });
   }
-  res.json({ success: true, token: signToken(user.email), user: await publicUser(user) });
+  res.json({ success: true, token: signToken(user.email), user: await publicUser(await maybeSync(user)) });
 }));
 
 app.post("/api/login", wrap(async (req, res) => {
@@ -502,7 +513,7 @@ app.post("/api/login", wrap(async (req, res) => {
   const ok = user ? await checkPassword(password, user.password_hash) : (await checkPassword(password, "00:00"), false);
   if (!ok) return res.status(401).json({ error: "Incorrect login details." });
 
-  res.json({ success: true, token: signToken(user.email), user: await publicUser(user) });
+  res.json({ success: true, token: signToken(user.email), user: await publicUser(await maybeSync(user)) });
 }));
 
 app.get("/api/profile", requireAuth, wrap(async (req, res) => {
@@ -514,7 +525,7 @@ app.get("/api/profile", requireAuth, wrap(async (req, res) => {
 /* HOME, NOTIFICATIONS                                                 */
 /* ------------------------------------------------------------------ */
 
-app.get("/api/home", requireAuth, wrap(async (req, res) => {
+app.get("/api/home", requireAuth, requirePaid, wrap(async (req, res) => {
   req.user = await maybeSync(req.user);
   res.json({
     success: true,
@@ -525,7 +536,7 @@ app.get("/api/home", requireAuth, wrap(async (req, res) => {
 }));
 
 // A daily mood notification for each of the last 7 days, plus a quiz reminder if today's quiz isn't done.
-app.get("/api/notifications", requireAuth, wrap(async (req, res) => {
+app.get("/api/notifications", requireAuth, requirePaid, wrap(async (req, res) => {
   const today = getToday();
   const items = [];
 
@@ -544,7 +555,7 @@ app.get("/api/notifications", requireAuth, wrap(async (req, res) => {
 /* QUIZ                                                                */
 /* ------------------------------------------------------------------ */
 
-app.get("/api/quiz", requireAuth, wrap(async (req, res) => {
+app.get("/api/quiz", requireAuth, requirePaid, wrap(async (req, res) => {
   const today = getToday();
   const done = await findResult(req.user.email, today);
   if (done) return res.json({ success: true, date: today, completed: true, result: formatResult(done) });
@@ -555,7 +566,7 @@ app.get("/api/quiz", requireAuth, wrap(async (req, res) => {
   });
 }));
 
-app.post("/api/quiz/submit", requireAuth, wrap(async (req, res) => {
+app.post("/api/quiz/submit", requireAuth, requirePaid, wrap(async (req, res) => {
   const { email, star_sign: sign } = req.user;
   const answers = req.body.answers;
   const today = getToday();
